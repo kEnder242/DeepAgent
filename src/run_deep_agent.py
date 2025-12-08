@@ -105,7 +105,7 @@ def parse_args():
     parser.add_argument('--serper_api_key', type=str, default=None, help="Google Serper API key.")
     parser.add_argument('--eval', action='store_true', help="Whether to run evaluation after generation.")
     parser.add_argument('--seed', type=int, default=None, help="Random seed for generation. If not set, will use current timestamp as seed.")
-    parser.add_argument('--concurrent_limit', type=int, default=32, help="Maximum number of concurrent API calls")
+    parser.add_argument('--concurrent_limit', type=int, default=4, help="Maximum number of concurrent API calls")
     return parser.parse_args()
 
 
@@ -133,14 +133,15 @@ async def generate_response(
             async with semaphore:
                 if generate_mode == "chat":
                     messages = [{"role": "user", "content": prompt}]
-                    formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    if tokenizer.chat_template:
+                        formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    else:
+                        formatted_prompt = prompt
                     # Check if we need to add <think> token for reasoning models
                     if think_mode and "<think>\n" not in formatted_prompt:
                         formatted_prompt = formatted_prompt + "<think>\n"
                     if not think_mode and "<think>\n" in formatted_prompt:
                         formatted_prompt = formatted_prompt.replace("<think>\n", "\n")
-                else:
-                    formatted_prompt = prompt
 
                 response = await client.completions.create(
                     model=model_name,
@@ -228,7 +229,6 @@ async def run_tool_selection(
     match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
     if match:
         final_tools = match.group(1)
-    else:
         # Fallback to returning the original tools if no final tools are found
         final_tools = json.dumps(openai_functions_for_prompt, indent=2)
 
@@ -448,7 +448,6 @@ async def generate_main_reasoning_sequence(
                     seq['prompt'] += append_text
                     seq['output'] += append_text
                     total_tokens += len(append_text.split())
-                else:
                     if args.dataset_name == 'toolhop':
                         executable_tools = list(seq['item'].get('tools', {}).values())
                         initial_retrieved_tools = tool_manager.retrieve_tools(
@@ -456,7 +455,6 @@ async def generate_main_reasoning_sequence(
                             args.top_k,
                             executable_tools
                         )
-                    else:
                         initial_retrieved_tools = tool_manager.retrieve_tools(
                             tool_search_query,
                             args.top_k
@@ -497,7 +495,6 @@ async def generate_main_reasoning_sequence(
                     seq['prompt'] += append_text
                     seq['output'] += append_text
                     total_tokens += len(append_text.split())
-                else:
                     try:
                         tool_call_dict = json.loads(tool_call_query)
                         
@@ -566,7 +563,6 @@ async def generate_main_reasoning_sequence(
                     seq['prompt'] += append_text
                     seq['output'] += append_text
                     total_tokens += len(append_text.split())
-                else:
                     episode_memory, working_memory, tool_memory = await run_thought_folding(
                         client=aux_client,
                         tokenizer=aux_tokenizer,
@@ -586,7 +582,7 @@ async def generate_main_reasoning_sequence(
                         "tool_memory": tool_memory,
                     })
                     print(seq['interactions'][-1])
-                    total_tokens = len(seq['prompt'].split())
+                    total_tokens += len(seq['prompt'].split())
                     total_folds += 1
                     
             # Subsequent responses use completion mode
@@ -612,7 +608,6 @@ async def generate_main_reasoning_sequence(
             seq['output'] += response.replace('</think>\n', '')
             seq['prompt'] += response.replace('</think>\n', '')
 
-        else:
             if args.dataset_name in ['alfworld', 'webshop']:
                 # For ALFWorld and WebShop, if actions are not allowed, the task completion is already determined, return directly
                 return seq
@@ -689,10 +684,12 @@ async def main_async():
     tool_manager.set_runtime_clients(vqa_client=vqa_client, semaphore=semaphore, aux_client=aux_client, aux_model_name=args.aux_model_name)
 
     # ---------------------- Define output directory ----------------------
+    model_short_name = args.model_name.lower().replace(":", "-") # Default value
     if 'qwq' in args.model_name.lower():
-        model_short_name = 'qwq'
         if '-v' in args.model_name.lower():
             model_short_name = args.model_name.lower()
+        else:
+            model_short_name = 'qwq'
     elif 'qwen3' in args.model_name.lower():
         if '32b' in args.model_name.lower():
             model_short_name = 'qwen3-32b'
@@ -704,18 +701,17 @@ async def main_async():
         if 'qwen-7b' in args.model_name.lower():
             model_short_name = 'dpsk-qwen-7b'
         elif 'qwen-14b' in args.model_name.lower():
-            model_short_name = 'dpsk-qwen-14b'
+            model_short_name = 'dpsk-14b'
         elif 'qwen-32b' in args.model_name.lower():
-            model_short_name = 'dpsk-qwen-32b'
+            model_short_name = 'dpsk-32b'
         else:
             model_short_name = args.model_name.split('/')[-1].lower().replace('-instruct', '')
-    else:
-        model_short_name = args.model_name.split('/')[-1].lower().replace('-instruct', '')
 
     output_dir = f'./outputs/{args.dataset_name}.{model_short_name}.deepagent'
     os.makedirs(output_dir, exist_ok=True)
 
     # ---------------------- Load and prepare data ----------------------
+    data_list = [] # Initialize data_list to prevent UnboundLocalError
     if args.single_question:
         data_list = [{'Question': args.single_question}]
         args.dataset_name = 'custom'
@@ -741,7 +737,7 @@ async def main_async():
                         'id': i,
                         'session_id': f'fixed_{i}',
                     })
-        if args.dataset_name == 'api_bank':
+        elif args.dataset_name == 'api_bank':
             # Load API-Bank data
             from tools.api_bank import APIBankDataLoader
             data_loader = APIBankDataLoader(args.api_bank_data_path)
@@ -754,7 +750,6 @@ async def main_async():
             if len(data_list) > args.subset_num:
                 if args.dataset_name in ['alfworld', 'webshop']:
                     data_list = data_list[:args.subset_num]
-                else:
                     data_list = random.sample(data_list, args.subset_num)
 
     # ---------------------- Prepare sequences ----------------------
@@ -846,9 +841,8 @@ async def main_async():
                 question = item.get('requirement', '')
                 # Level-3需要工具搜索，不提供预定义工具列表
                 tool_list = []
-            
-            item['Question'] = question
 
+            item['Question'] = question
         elif args.dataset_name == 'gaia':
             # GAIA dataset
             from tools.tool_manager import get_gaia_tool_docs
@@ -1052,9 +1046,9 @@ async def main_async():
                 output_metrics_overall_path=output_metrics_overall_path,
                 args=args
             )
-        else:
-            # For other datasets, use standard evaluation
-            await run_evaluation(
+                else:
+                    # For other datasets, use standard evaluation
+                    await run_evaluation(
                 data=references,
                 input_list=[item.get('question', item.get('Question', item.get('query', ''))) for item in references],
                 output_list=output_list,
